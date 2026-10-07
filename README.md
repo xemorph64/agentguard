@@ -9,7 +9,8 @@ SHA-256 hash-chained ledger. Full write-up: [docs/AgentGuard_Project_Report.md](
 ## Run
 
 ```bash
-./run.sh
+./run.sh        # Linux / macOS
+run.bat         # Windows (or just double-click it)
 ```
 
 First run creates `.venv` and installs `backend/requirements.txt`. Then open:
