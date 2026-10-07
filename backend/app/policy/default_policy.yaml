@@ -1,0 +1,58 @@
+# AgentGuard demo policy — typology-aware intervention routing (PRD §5)
+policy_version: "2026.10.07-1"
+
+thresholds:
+  allow: 30        # 0-30   ALLOW
+  nudge: 50        # 31-50  ALLOW + NUDGE
+  stepup: 45       # ATO typologies route to STEP_UP from here (tuned for demo data)
+  cooling: 45      # coercion typologies route to COOLING_ROOM from here (tuned for demo data)
+  pause_low: 71    # 71-80  PAUSE (ambiguous / conflicting agents)
+  pause_high: 80
+  block: 81        # 81-100 BLOCK
+
+hold:
+  # risk-proportional HOLD CREDIT (PRD §5.3)
+  base_minutes: {T1: 180, T2: 120, T5: 45, T6: 45, T8: 30, T12: 60, T13: 45, default: 60}
+  min_minutes: 5
+  max_minutes: 240
+
+routing:
+  T1: cooling_room
+  T2: cooling_room
+  T3: step_up
+  T4: step_up
+  T5: hold_credit
+  T6: hold_credit
+  T7: rate_limit_block
+  T8: hold_credit
+  T9: silent_monitor
+  T10: silent_monitor
+  T11: silent_monitor
+  T12: hold_credit
+  T13: hold_credit
+  T14: silent_monitor
+
+counsel:
+  max_discount: 15   # bounded; can never override a hard rule
+
+hard_rules:
+  sanctions_list: block
+  fri_very_high_payee: block
+  customer_killswitch: block
+  ncrp_reported_beneficiary: hold_credit
+
+fusion:
+  weights: {transaction: 0.20, behavior: 0.20, velocity: 0.15, mule: 0.25, aml: 0.20}
+
+agent_timeouts_ms:
+  transaction: 15
+  behavior: 15
+  velocity: 10
+  mule: 35
+  aml: 40
+  counsel: 15
+
+flat_lag_reference:
+  # RBI 2026 proposal used as the comparison baseline on the Economics page
+  amount_threshold: 10000
+  lag_minutes: 60

@@ -1,0 +1,7 @@
+pandas
+numpy
+scikit-learn
+xgboost
+networkx
+joblib
+shap        # optional: exact SHAP for the AML detail card

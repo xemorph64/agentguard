@@ -1,0 +1,18 @@
+{
+  "pr_auc": 0.9953458941986885,
+  "roc_auc": 0.9976525821596245,
+  "positives": 213,
+  "n": 24552,
+  "mid": {
+    "threshold": 0.9411764705882353,
+    "precision": 1.0,
+    "recall": 0.9953051643192489,
+    "false_positive_rate": 0.0
+  },
+  "hi": {
+    "threshold": 0.9411764705882353,
+    "precision": 1.0,
+    "recall": 0.9953051643192489,
+    "false_positive_rate": 0.0
+  }
+}
