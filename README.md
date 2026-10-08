@@ -13,8 +13,12 @@ SHA-256 hash-chained ledger. Full write-up: [docs/AgentGuard_Project_Report.md](
 run.bat         # Windows (or just double-click it)
 ```
 
-First run creates `.venv` and installs `backend/requirements.txt`. Then open http://localhost:8000
-(API docs at `/docs`). Everything — fonts, Three.js — is served locally; no internet needed at the venue.
+First run creates `.venv` and installs `backend/requirements.txt` (needs internet, a few minutes). Then open
+http://localhost:8000 (API docs at `/docs`; `run.bat` opens the browser for you). Everything — fonts, Three.js —
+is served locally; no internet needed at the venue.
+
+**Windows:** install Python 3.12 or 3.13 from python.org and tick *Add python.exe to PATH*. Different port:
+`set PORT=8001` then `run.bat` in the same Command Prompt. Tests: `.venv\Scripts\python -m pytest backend\tests`.
 
 **For judges:** press **Start demo** (top right). It resets the workspace and walks through a legitimate
 payment → account takeover → mule network → follow the money → agent detection → block → audit, ending on

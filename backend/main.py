@@ -1,5 +1,12 @@
 from collections import Counter, deque, defaultdict
 from pathlib import Path
+import mimetypes
+
+# Windows reads MIME types from the registry, where .js is often "text/plain"; browsers then
+# refuse to load the console's ES modules. Pin the types the console needs on every platform.
+for _ext, _type in ((".js", "text/javascript"), (".mjs", "text/javascript"), (".css", "text/css"),
+                    (".woff2", "font/woff2"), (".svg", "image/svg+xml")):
+    mimetypes.add_type(_type, _ext)
 from typing import Optional
 import uuid
 
