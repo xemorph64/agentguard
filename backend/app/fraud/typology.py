@@ -37,7 +37,9 @@ def classify(ctx: Ctx, feats: dict, agent_scores: dict) -> list[dict]:
         t1.append(("payee account < 30 days old", 0.10))
     if p.persona == "elderly":
         t1.append(("elderly payer profile", 0.05))
-    add("T1", sum(c for _, c in t1), [e for e, _ in t1])
+    # coercion is what makes it T1: an unusual payment without a call/screen-share is not digital arrest
+    if be.get("on_call") or be.get("screen_share"):
+        add("T1", sum(c for _, c in t1), [e for e, _ in t1])
 
     # T3 account takeover via SIM swap
     t3 = []
@@ -47,16 +49,20 @@ def classify(ctx: Ctx, feats: dict, agent_scores: dict) -> list[dict]:
         t3.append(("SIM changed recently", 0.30))
     if be.get("pin_reset_24h"):
         t3.append(("UPI PIN reset in last 24h", 0.20))
+    if be.get("impossible_travel_kmh", 0) >= 500:
+        t3.append((f"impossible travel ({int(be['impossible_travel_kmh'])} km/h)", 0.20))
     if tx.get("payee_novel"):
         t3.append(("new payee", 0.10))
-    add("T3", sum(c for _, c in t3), [e for e, _ in t3])
+    # an unfamiliar device alone is just a new phone; takeover needs a credential change or travel
+    if be.get("sim_change_72h") or be.get("pin_reset_24h") or be.get("impossible_travel_kmh", 0) >= 500:
+        add("T3", sum(c for _, c in t3), [e for e, _ in t3])
 
     # T4 remote access / screen share
     t4 = []
     if be.get("screen_share"):
         t4.append(("screen-share/accessibility flag", 0.60))
-    if be.get("new_device"):
-        t4.append(("new device fingerprint", 0.20))
+        if be.get("new_device"):
+            t4.append(("new device fingerprint", 0.20))
     add("T4", sum(c for _, c in t4), [e for e, _ in t4])
 
     # T7 probing
@@ -65,12 +71,18 @@ def classify(ctx: Ctx, feats: dict, agent_scores: dict) -> list[dict]:
         t7.append((f"{ve['micro_burst_10m']} micro-payments in 10 min", 0.60))
     if ve.get("distinct_payees_1h", 0) >= 6:
         t7.append((f"{ve['distinct_payees_1h']} distinct payees in 1h", 0.35))
+    linked = _probe_linked_payee(ctx)
+    if linked and t.amount > 1000:
+        t7.append((f"payee shares a device with {linked} earlier probe recipient(s)", 0.30))
     add("T7", sum(c for _, c in t7), [e for e, _ in t7])
 
     # T8 fan-in mule collector
     t8 = []
-    if mu.get("distinct_sources_24h", 0) >= 8:
-        t8.append((f"{mu['distinct_sources_24h']} inbound sources in 24h", 0.35))
+    n_src = mu.get("distinct_sources_24h", 0)
+    if n_src >= 3:
+        t8.append((f"{n_src} inbound sources in 24h", 0.35 if n_src >= 8 else 0.25 if n_src >= 5 else 0.15))
+    if n_src >= 3 and (mu.get("unlinked_sources") or 0) >= 0.7:
+        t8.append(("senders are mutually unrelated", 0.10))
     if mu.get("pass_through_24h", 0) >= 0.85:
         t8.append((f"pass-through ratio {mu['pass_through_24h']}", 0.25))
     if mu.get("median_hold_min") is not None and mu["median_hold_min"] < 30:
@@ -108,13 +120,16 @@ def classify(ctx: Ctx, feats: dict, agent_scores: dict) -> list[dict]:
 
     # T12 mule farm (shared device infrastructure)
     t12 = []
-    if mu.get("shared_device_accounts", 0) >= 8:
-        t12.append((f"device shared by {mu['shared_device_accounts']} accounts", 0.50))
-    if (mu.get("unlinked_sources", 0) or 0) >= 0.7:
-        t12.append(("inbound sources mutually unlinked", 0.30))
-    if 0 < mu.get("account_age_days", 9999) < 30:
-        t12.append(("young account", 0.15))
-    add("T12", sum(c for _, c in t12), [e for e, _ in t12])
+    if mu.get("shared_device_accounts", 0) >= 5:
+        t12.append((f"device shared by {mu['shared_device_accounts'] + 1} accounts", 0.50))
+    elif mu.get("shared_device_accounts", 0) >= 2:
+        t12.append((f"device shared by {mu['shared_device_accounts'] + 1} accounts", 0.25))
+    if t12:   # a mule *farm* needs shared device infrastructure; the rest only corroborates it
+        if (mu.get("unlinked_sources", 0) or 0) >= 0.7:
+            t12.append(("inbound sources mutually unlinked", 0.30))
+        if 0 < mu.get("account_age_days", 9999) < 30:
+            t12.append(("young account", 0.15))
+        add("T12", sum(c for _, c in t12), [e for e, _ in t12])
 
     # T13 dormant awakening
     t13 = []
@@ -126,3 +141,24 @@ def classify(ctx: Ctx, feats: dict, agent_scores: dict) -> list[dict]:
 
     out.sort(key=lambda d: -d["confidence"])
     return out
+
+
+def _probe_linked_payee(ctx: Ctx) -> int:
+    """How many of the payer's micro-payment recipients (last hour) are this payee
+    or share a device with it — i.e. the probes were testing this payee's route."""
+    t = ctx.txn
+    probed = {m[3] for m in ctx.store.ledger_moves.get(t.payer, ())
+              if m[1] == "out" and m[2] <= 50 and m[0] >= t.ts - 3600}
+    if not probed:
+        return 0
+    g = ctx.graph
+    payee_devices = {g.edges[i]["dst"] for i in g._out.get(t.payee, ()) if g.edges[i]["type"] == "USED_DEVICE"}
+    linked = 0
+    for acc in probed:
+        if acc == t.payee:
+            linked += 1
+            continue
+        devs = {g.edges[i]["dst"] for i in g._out.get(acc, ()) if g.edges[i]["type"] == "USED_DEVICE"}
+        if devs & payee_devices:
+            linked += 1
+    return linked

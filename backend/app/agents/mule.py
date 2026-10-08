@@ -21,6 +21,7 @@ class MuleAgent(BaseAgent):
         payee_res = super().run(ctx)
         sender_ctx = copy.copy(ctx)
         sender_ctx.payee = ctx.payer
+        sender_ctx.mule_side = "payer"
         payer_res = super().run(sender_ctx)
         best = payer_res if payer_res.status == "ok" and payer_res.score > payee_res.score else payee_res
         if best.status == "ok":
@@ -28,10 +29,27 @@ class MuleAgent(BaseAgent):
         return best
 
     def features(self, ctx: Ctx) -> dict:
+        """Features of the account under evaluation (ctx.payee), *including this payment*.
+
+        Pre-transaction detection has to be prospective: a mule is caught at the moment it
+        tries to forward, so the pending debit counts toward pass-through and holding time.
+        """
         payee = ctx.payee
-        io = ctx.store.inflow_outflow(payee.id, since=ctx.now_ts - 86400)
+        t = ctx.txn
+        io = dict(ctx.store.inflow_outflow(payee.id, since=ctx.now_ts - 86400))
         hold_min = ctx.store.median_hold_minutes(payee.id)
         sources = ctx.graph.fan_in(payee.id, 86400)["sources"]
+        if getattr(ctx, "mule_side", "payee") == "payer":
+            io["outflow"] += t.amount
+            last_in = max((m[0] for m in ctx.store.ledger_moves.get(payee.id, ()) if m[1] == "in"), default=None)
+            if last_in is not None:
+                pending_hold = max(0.0, (t.ts - last_in) / 60.0)
+                hold_min = pending_hold if hold_min is None else min(hold_min, pending_hold)
+        else:
+            io["inflow"] += t.amount
+            if t.payer not in sources:
+                sources = sorted([*sources, t.payer])
+                io["distinct_sources"] += 1
         if ctx.disable_graph:
             # ablation: the graph is down → linkage + device features unavailable
             unlinked, shared = 0.0, 0
@@ -75,15 +93,17 @@ class MuleAgent(BaseAgent):
         age = f["account_age_days"]
         hold = f["median_hold_min"]
         hold_f = 0.3 if hold is None else 1.0 if hold < 10 else 0.7 if hold < 30 else 0.4 if hold < 60 else 0.1
-        passthrough_f = clip((f["pass_through_24h"] - 0.5) / 0.5) if f["pass_through_24h"] > 0.5 else 0.0
+        pt = f["pass_through_24h"]
+        # out ≈ in is pass-through; out ≫ in is someone spending their own balance (rent, bills)
+        passthrough_f = clip((pt - 0.5) / 0.5) if 0.5 < pt <= 1.5 else 0.0
         c = {
-            "distinct_sources_24h": WEIGHTS["distinct_sources_24h"] * clip(f["distinct_sources_24h"] / 20.0),
+            "distinct_sources_24h": WEIGHTS["distinct_sources_24h"] * clip(f["distinct_sources_24h"] / 10.0),
             "unlinked_sources": WEIGHTS["unlinked_sources"] * f["unlinked_sources"],
             "pass_through_24h": WEIGHTS["pass_through_24h"] * passthrough_f,
             "median_hold_min": WEIGHTS["median_hold_min"] * hold_f,
             "account_age_days": WEIGHTS["account_age_days"]
                 * (1.0 if age < 7 else 0.7 if age < 30 else 0.3 if age < 90 else 0.0),
-            "shared_device_accounts": WEIGHTS["shared_device_accounts"] * clip(f["shared_device_accounts"] / 10.0),
+            "shared_device_accounts": WEIGHTS["shared_device_accounts"] * clip(f["shared_device_accounts"] / 6.0),
             "dormant_awakening": WEIGHTS["dormant_awakening"] * (1.0 if f["dormant_awakening"] else 0.0),
             "phone_fri": WEIGHTS["phone_fri"] * {"VERY_HIGH": 1.0, "HIGH": 0.7, "MEDIUM": 0.3, "LOW": 0.0}.get(f["phone_fri"], 0.0),
         }

@@ -42,6 +42,14 @@ COUNTERFACTUAL_MAP = {
 }
 
 FRICTION_OUTCOMES = {"COOLING_ROOM", "HOLD_CREDIT", "PAUSE", "BLOCK", "STEP_UP"}
+MULE_TYPOLOGIES = {"T8", "T9", "T12", "T13"}
+
+
+def risk_side(dominant: str | None, mule_features: dict | None) -> str:
+    """Which party a decision implicates: the mule side for mule typologies, else the beneficiary."""
+    if dominant in MULE_TYPOLOGIES and mule_features:
+        return mule_features.get("side", "payee")
+    return "payee"
 
 
 class Orchestrator:
@@ -86,6 +94,11 @@ class Orchestrator:
             return "customer_killswitch", "BLOCK"
         if payee.id in self.svcs.chase.ncrp_accounts:
             return "ncrp_reported_beneficiary", "HOLD_CREDIT"
+        flagged = self.svcs.graph.flagged
+        if p.id in flagged:
+            return "flagged_account_outbound", "BLOCK"       # a caught mule cannot cash out later
+        if payee.id in flagged:
+            return "flagged_beneficiary", "HOLD_CREDIT"      # new credits to it are held in lien
         return None, None
 
     # ---------- fusion ----------
@@ -95,9 +108,12 @@ class Orchestrator:
         wsum = sum(weights[r.agent] for r in ok)
         score = sum(weights[r.agent] * r.score for r in ok) / wsum if wsum else 0.0
         # peak-aware boost: one confident specialist must not be averaged away by quiet ones
-        peak = max((r.score for r in ok), default=0.0)
+        ranked = sorted((r.score for r in ok), reverse=True)
+        peak = ranked[0] if ranked else 0.0
         if peak >= 50:
             score += (peak - score) / 2
+        corroboration = sum(max(0.0, s - 40) / 60 for s in ranked[1:])
+        score += (100 - score) * min(0.6, 0.5 * corroboration)
         counsel_res = self.counsel.run(ctx)
         discount = self.counsel.discount(counsel_res.score, bool(hard_rule))
         final = max(0.0, score - discount)
@@ -106,7 +122,8 @@ class Orchestrator:
 
     # ---------- main entry ----------
     async def score(self, txn: Txn, record: bool = True, with_ablation: bool = False,
-                    with_counterfactual: bool = True, run_id: str = "") -> Decision:
+                    with_counterfactual: bool = True, run_id: str = "",
+                    overrides: dict | None = None) -> Decision:
         svcs = self.svcs
         t0 = time.perf_counter()
         txn.ts = txn.ts or now()
@@ -116,7 +133,7 @@ class Orchestrator:
                                          "payee": txn.payee, "amount": txn.amount,
                                          "source": txn.source, "run_id": txn.run_id})
 
-        ctx = self.build_ctx(txn)
+        ctx = self.build_ctx(txn, overrides=overrides)
         results = await self.run_agents(ctx)
         hard_rule, hard_outcome = self.hard_rules(ctx)
         fused, counsel_res, discount, any_unknown = self.fuse(results, ctx, hard_rule)
@@ -127,6 +144,10 @@ class Orchestrator:
         agent_scores["counsel"] = counsel_res.score
         typs = typology_mod.classify(ctx, feats, agent_scores)
         dominant = typs[0]["typology"] if typs else None
+        if (score <= svcs.policy.th["allow"] or (typs and typs[0]["confidence"] < 0.3)) and not hard_rule:
+            dominant = None   # a low-risk payment / weak hint has no fraud pattern to name
+        mule_feats = feats.get("mule", {})
+        mule_score = agent_scores.get("mule", 0)
 
         if hard_rule:
             outcome, reason, minutes = hard_outcome, f"hard rule: {hard_rule}", None
@@ -137,10 +158,12 @@ class Orchestrator:
             outcome, reason, minutes = svcs.policy.route(
                 score, typs, dominant,
                 cooling_override=txn.cooling_override, stepup_failed=txn.stepup_failed,
+                mule_cashout=(dominant in MULE_TYPOLOGIES and mule_feats.get("side") == "payer"
+                              and mule_score >= svcs.policy.policy.get("mule_cashout_block", 60)),
             )
-            if outcome == "HOLD_CREDIT" and minutes is None:
-                ratio = txn.amount / max(svcs.store.inflow_outflow(txn.payee, since=txn.ts - 7 * 86400)["inflow"], 1.0)
-                minutes = svcs.policy.hold_minutes(dominant, score, ratio)
+        if outcome == "HOLD_CREDIT" and minutes is None:
+            ratio = txn.amount / max(svcs.store.inflow_outflow(txn.payee, since=txn.ts - 7 * 86400)["inflow"], 1.0)
+            minutes = svcs.policy.hold_minutes(dominant, score, ratio)
 
         decision = Decision(
             txn_id=txn.txn_id, outcome=outcome, score=score, typologies=typs, dominant=dominant,
@@ -153,6 +176,7 @@ class Orchestrator:
             hold_minutes=minutes,
         )
         decision.receipt_id = f"RC-{txn.txn_id}"
+        decision.features["risk_side"] = risk_side(dominant, mule_feats)
 
         # ablation (adaptive-attacker demo): same txn with graph features unavailable
         if with_ablation and not hard_rule:
@@ -174,18 +198,23 @@ class Orchestrator:
             if top_agent:
                 feat_name = top_agent.signals[0]["feature"]
                 if feat_name in COUNTERFACTUAL_MAP:
-                    overrides, text = COUNTERFACTUAL_MAP[feat_name]
+                    cf_overrides, text = COUNTERFACTUAL_MAP[feat_name]
                     cf_txn = Txn(**{**txn.__dict__})
-                    cf_ctx = self.build_ctx(cf_txn, overrides=overrides)
+                    cf_ctx = self.build_ctx(cf_txn, overrides={**(overrides or {}), **cf_overrides})
                     res3 = [a.run(cf_ctx) for a in self.agents]
                     fused3, c3, _d, _u = self.fuse(res3, cf_ctx, None)
                     score3 = int(round(fused3))
                     typs3 = typology_mod.classify(cf_ctx, {r.agent: r.features for r in res3},
                                                   {r.agent: r.score for r in res3})
                     dom3 = typs3[0]["typology"] if typs3 else None
+                    if score3 <= svcs.policy.th["allow"]:
+                        dom3 = None
+                    m3 = next((r for r in res3 if r.agent == "mule" and r.status == "ok"), None)
                     out3, _r3, _m3 = svcs.policy.route(
                         score3, typs3, dom3, cooling_override=txn.cooling_override,
-                        stepup_failed=txn.stepup_failed)
+                        stepup_failed=txn.stepup_failed,
+                        mule_cashout=bool(m3 and dom3 in MULE_TYPOLOGIES and m3.features.get("side") == "payer"
+                                          and m3.score >= svcs.policy.policy.get("mule_cashout_block", 60)))
                     decision.counterfactual = {
                         "flip_feature": feat_name, "text": f"Would be {out3} if {text}.",
                         "score_if": score3, "outcome_if": out3,
@@ -240,6 +269,11 @@ class Orchestrator:
             payer.known_payees.setdefault(txn.payee, []).append(txn.ts)
             if txn.device_fp:
                 payer.known_devices.add(txn.device_fp)
+
+        if d.outcome == "BLOCK":
+            # the implicated party becomes a known-bad node for distance-to-flagged features
+            side = d.features.get("risk_side", "payee")
+            svcs.graph.flagged.add(txn.payer if side == "payer" else txn.payee)
 
         if d.outcome == "HOLD_CREDIT" and d.hold_minutes:
             hold = svcs.holds.create(txn, d, d.hold_minutes)

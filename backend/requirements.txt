@@ -9,3 +9,4 @@ xgboost
 networkx
 joblib
 httpx
+pytest

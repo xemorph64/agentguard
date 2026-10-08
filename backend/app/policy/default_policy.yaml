@@ -32,6 +32,14 @@ routing:
   T13: hold_credit
   T14: silent_monitor
 
+# Mule agent score at which an outbound payment *from* the suspected mule is blocked
+mule_cashout_block: 60
+
+# AML typologies (T9-T11, T14) stay silent (no tipping-off) until the pattern is unambiguous
+silent_monitor_escalation:
+  confidence: 0.8
+  score: 45
+
 counsel:
   max_discount: 15   # bounded; can never override a hard rule
 
@@ -40,6 +48,8 @@ hard_rules:
   fri_very_high_payee: block
   customer_killswitch: block
   ncrp_reported_beneficiary: hold_credit
+  flagged_account_outbound: block
+  flagged_beneficiary: hold_credit
 
 fusion:
   weights: {transaction: 0.20, behavior: 0.20, velocity: 0.15, mule: 0.25, aml: 0.20}
@@ -50,7 +60,10 @@ agent_timeouts_ms:
   velocity: 10
   mule: 35
   aml: 40
-  counsel: 15
+  # Mule agent score at which an outbound payment *from* the suspected mule is blocked
+mule_cashout_block: 60
+
+counsel: 15
 
 flat_lag_reference:
   # RBI 2026 proposal used as the comparison baseline on the Economics page

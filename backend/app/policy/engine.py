@@ -53,7 +53,8 @@ class PolicyEngine:
     # ---------- routing: (score, dominant typology, state) -> outcome ----------
     def route(self, score: int, typologies: list, dominant: Optional[str],
               cooling_override: bool = False, stepup_failed: bool = False,
-              hard_rule: Optional[str] = None, hard_outcome: Optional[str] = None) -> tuple[str, str, Optional[int]]:
+              hard_rule: Optional[str] = None, hard_outcome: Optional[str] = None,
+              mule_cashout: bool = False) -> tuple[str, str, Optional[int]]:
         """Returns (outcome, reason, hold_minutes)."""
         t = self.th
         if hard_rule:
@@ -66,6 +67,11 @@ class PolicyEngine:
 
         if stepup_failed:
             return "BLOCK", "step-up re-authentication failed", None
+
+        # the payer itself is the suspected mule: holding the beneficiary's credit would let the
+        # layering continue one hop later — stop the cash-out at source
+        if mule_cashout and score >= t["stepup"]:
+            return "BLOCK", f"{dominant}: suspected mule forwarding received funds → block cash-out", None
 
         conf = typologies[0]["confidence"] if typologies else 0.0
         if dominant and conf >= 0.4:
@@ -81,7 +87,8 @@ class PolicyEngine:
                 return "BLOCK", f"{dominant} probing pattern → rate-limit and block", None
             if route == "silent_monitor":
                 # AML: never tip off. Watch silently; escalate only if score is high.
-                if score >= t["pause_high"]:
+                esc = self.policy.get("silent_monitor_escalation", {})
+                if score >= t["pause_high"] or (conf >= esc.get("confidence", 2.0) and score >= esc.get("score", 101)):
                     return "PAUSE", f"{dominant} high-confidence ring pattern → quiet analyst review", None
                 return "ALLOW_NUDGE", f"{dominant} → silent monitoring, no customer friction", None
             # score below the typology's friction gate → nudge only

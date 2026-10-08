@@ -46,6 +46,15 @@ class Graph:
     def add_edge(self, src: str, dst: str, etype: str, **props) -> dict:
         if etype == "PAID" and props.get("txn_id") in self.edge_by_txn:
             return self.edges[self.edge_by_txn[props["txn_id"]]]
+        if etype == "USED_DEVICE":
+            # one edge per (account, device); repeat use updates it instead of duplicating
+            for i in self._out.get(src, ()):
+                e = self.edges[i]
+                if e["type"] == "USED_DEVICE" and e["dst"] == dst:
+                    e["props"]["count"] = e["props"].get("count", 1) + 1
+                    e["props"]["last_ts"] = props.get("ts", e["props"].get("last_ts"))
+                    return e
+            props = {"count": 1, "first_ts": props.get("ts"), "last_ts": props.get("ts"), **props}
         e = {"src": src, "dst": dst, "type": etype, "props": props}
         idx = len(self.edges)
         self.edges.append(e)
@@ -57,6 +66,11 @@ class Graph:
 
     def node(self, node_id: str) -> Optional[dict]:
         return self.nodes.get(node_id)
+
+    @staticmethod
+    def is_money(e: dict) -> bool:
+        """A PAID edge whose money actually moved (blocked/paused/cooling attempts did not)."""
+        return e["type"] == "PAID" and e["props"].get("settled", True)
 
     # ---------- bounded hot-path queries (the only ones the decision path uses) ----------
     def neighbors(self, node_id: str, direction: str = "out", etype: Optional[str] = None) -> list[dict]:
@@ -76,7 +90,7 @@ class Graph:
         sources, total, count = set(), 0.0, 0
         for i in self._in.get(account, ()):
             e = self.edges[i]
-            if e["type"] != "PAID":
+            if not self.is_money(e):
                 continue
             ts = e["props"].get("ts", 0)
             if ts < t0 or ts < min_ts:
@@ -91,7 +105,7 @@ class Graph:
         sinks, total = set(), 0.0
         for i in self._out.get(account, ()):
             e = self.edges[i]
-            if e["type"] != "PAID" or e["props"].get("ts", 0) < t0:
+            if not self.is_money(e) or e["props"].get("ts", 0) < t0:
                 continue
             sinks.add(e["dst"])
             total += e["props"].get("amount", 0)
@@ -167,7 +181,7 @@ class Graph:
             for nid in frontier:
                 for i in [*self._out.get(nid, ()), *self._in.get(nid, ())]:
                     e = self.edges[i]
-                    if e["type"] == "PAID":
+                    if self.is_money(e):
                         other = e["dst"] if e["src"] == nid else e["src"]
                         if other not in seen:
                             if other in self.flagged:
@@ -190,12 +204,22 @@ class Graph:
         for acc in store.accounts.values():
             fi = self.fan_in(acc.id, 86400)
             io = store.inflow_outflow(acc.id, since=t - 86400)
-            passthrough = (io["outflow"] / io["inflow"]) if io["inflow"] > 0 else 0.0
+            # attempted outflow counts too: a blocked cash-out is still evidence of intent
+            attempted_out = sum(self.edges[i]["props"].get("amount", 0) for i in self._out.get(acc.id, ())
+                                if self.edges[i]["type"] == "PAID" and self.edges[i]["props"].get("ts", 0) >= t - 86400)
+            passthrough = (max(io["outflow"], attempted_out) / io["inflow"]) if io["inflow"] > 0 else 0.0
             shared = self.shared_device_count(acc.id)
+            hold = store.median_hold_minutes(acc.id)
             risk = 0.0
-            risk += min(fi["distinct_sources"] / 20.0, 1.0) * 35
-            risk += max(0.0, passthrough - 0.5) / 0.5 * 25 if passthrough > 0.5 else 0
-            risk += min(shared / 8.0, 1.0) * 25
+            risk += min(fi["distinct_sources"] / 10.0, 1.0) * 30
+            risk += min((passthrough - 0.5) / 0.5, 1.0) * 25 if 0.5 < passthrough <= 1.5 else 0
+            risk += min(shared / 6.0, 1.0) * 25
+            if acc.age_days < 30 and fi["distinct_sources"] >= 3:
+                risk += 10
+            if hold is not None and hold < 30 and fi["distinct_sources"] >= 3:
+                risk += 10
+            if acc.id in self.flagged:
+                risk += 15
             if acc.dormant_since is not None and fi["txns"] >= 3:
                 risk += 10
             if acc.fri_level in ("HIGH", "VERY_HIGH"):
@@ -232,8 +256,7 @@ class Graph:
             self.community[acc_id] = comp_ids[root]
         # bounded cycle detection (3..6 hops, value retention >= 0.8)
         self.cycle_members = set()
-        accounts = [a for a in store.accounts if a.startswith("ACC")]
-        rng_check = accounts[:600]
+        rng_check = list(store.accounts)[:600]
         for start in rng_check:
             path = [(start, 0.0)]
             self._dfs_cycles(start, start, depth=0, max_depth=6, path=path, visited={start})
@@ -244,7 +267,7 @@ class Graph:
             return
         for i in self._out.get(cur, ()):
             e = self.edges[i]
-            if e["type"] != "PAID":
+            if not self.is_money(e):
                 continue
             nxt = e["dst"]
             amt = e["props"].get("amount", 0)
